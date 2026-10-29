@@ -1,0 +1,101 @@
+---
+- name: Validate NVIDIA driver installation method
+  ansible.builtin.assert:
+    that:
+      - nvidia_driver_method in ['ubuntu_drivers', 'g4dn_script']
+    fail_msg: "nvidia_driver_method must be 'ubuntu_drivers' or 'g4dn_script'."
+
+- name: Install driver selection and PCI inspection tools
+  ansible.builtin.apt:
+    name:
+      - ubuntu-drivers-common
+      - pciutils
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Detect NVIDIA hardware on the host
+  ansible.builtin.command: lspci -nn
+  register: nvidia_pci
+  changed_when: false
+
+- name: Stop if no NVIDIA PCI device was detected
+  ansible.builtin.assert:
+    that:
+      - "'nvidia' in (nvidia_pci.stdout | lower)"
+    fail_msg: >-
+      No NVIDIA PCI device was detected with lspci. Use a GPU-enabled target or set
+      ollama_enable_gpu=false and disable both NVIDIA installation roles for CPU-only testing.
+
+- name: Check whether the NVIDIA driver is already usable
+  ansible.builtin.command: nvidia-smi
+  register: nvidia_smi_before
+  changed_when: false
+  failed_when: false
+
+- name: Copy custom G4dn NVIDIA setup script
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/{{ nvidia_g4dn_script_name }}"
+    dest: "{{ nvidia_g4dn_script_destination }}"
+    owner: root
+    group: root
+    mode: "0750"
+  when:
+    - nvidia_smi_before.rc != 0
+    - nvidia_driver_method == 'g4dn_script'
+
+- name: Install NVIDIA driver with the supplied G4dn script (without automatic reboot)
+  ansible.builtin.command:
+    argv: "{{ [nvidia_g4dn_script_destination] + nvidia_g4dn_script_args }}"
+  async: "{{ nvidia_driver_install_timeout }}"
+  poll: "{{ nvidia_driver_install_poll }}"
+  register: nvidia_g4dn_install
+  changed_when: true
+  when:
+    - nvidia_smi_before.rc != 0
+    - nvidia_driver_method == 'g4dn_script'
+
+- name: Install Ubuntu-recommended NVIDIA server driver
+  ansible.builtin.command:
+    argv:
+      - ubuntu-drivers
+      - install
+      - --gpgpu
+  async: "{{ nvidia_driver_install_timeout }}"
+  poll: "{{ nvidia_driver_install_poll }}"
+  register: nvidia_driver_install
+  changed_when: true
+  when:
+    - nvidia_smi_before.rc != 0
+    - nvidia_driver_method == 'ubuntu_drivers'
+
+- name: Record whether a driver installation was attempted in this run
+  ansible.builtin.set_fact:
+    # A successful install task can only be reached when nvidia-smi was not usable.
+    nvidia_driver_install_performed: "{{ nvidia_smi_before.rc != 0 }}"
+
+- name: Reboot after driver installation
+  ansible.builtin.reboot:
+    msg: "Rebooting after NVIDIA driver installation by Ansible"
+    reboot_timeout: 1200
+    connect_timeout: 10
+    post_reboot_delay: 15
+  when:
+    - nvidia_reboot_after_driver_install | bool
+    - nvidia_driver_install_performed | bool
+
+- name: Record deferred reboot when reboot is disabled
+  ansible.builtin.set_fact:
+    nvidia_reboot_pending: true
+  when:
+    - not (nvidia_reboot_after_driver_install | bool)
+    - nvidia_driver_install_performed | bool
+
+- name: Verify NVIDIA driver after installation or existing configuration
+  ansible.builtin.command: nvidia-smi
+  register: nvidia_smi_after
+  changed_when: false
+  retries: 12
+  delay: 10
+  until: nvidia_smi_after.rc == 0
+  when: not (nvidia_reboot_pending | default(false) | bool)

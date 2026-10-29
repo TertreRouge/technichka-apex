@@ -1,0 +1,3 @@
+---
+# Intentionally empty: the role uses a before/after comparison of daemon.json
+# and restarts Docker in the task only when the NVIDIA runtime configuration changes.

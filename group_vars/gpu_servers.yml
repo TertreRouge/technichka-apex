@@ -1,0 +1,69 @@
+---
+# Explicitly tested target scope for this project. Add OS releases only after CI/runtime validation.
+ubuntu_supported_versions:
+  - "22.04"
+  - "24.04"
+
+# Feature switches. Defaults target a real NVIDIA GPU server.
+install_docker: true
+# Set true only when Docker and the Compose plugin are already installed and managed elsewhere.
+docker_preinstalled: false
+install_nvidia_driver: true
+# Set true only when a working host driver is already installed and managed elsewhere.
+nvidia_driver_preinstalled: false
+install_nvidia_container_toolkit: true
+# Set true only when NVIDIA Container Toolkit is already configured for this Docker daemon.
+nvidia_container_toolkit_preinstalled: false
+install_ollama: true
+ollama_enable_gpu: true
+
+# Driver behavior.
+# ubuntu_drivers: Ubuntu's recommended server/computing driver (--gpgpu).
+# g4dn_script: supplied script specifically for AWS EC2 G4dn, Ubuntu 22.04/24.04 x86_64.
+nvidia_driver_method: "ubuntu_drivers"
+nvidia_reboot_after_driver_install: true
+nvidia_driver_install_timeout: 1800
+nvidia_driver_install_poll: 30
+nvidia_g4dn_script_name: "setup-nvidia-g4dn.sh"
+nvidia_g4dn_script_destination: "/usr/local/sbin/setup-nvidia-g4dn.sh"
+nvidia_g4dn_script_args:
+  - "--no-reboot"
+
+# Docker / NVIDIA Container Toolkit repositories and compatibility checks.
+docker_architecture_map:
+  x86_64: amd64
+  aarch64: arm64
+docker_conflicting_packages:
+  - docker.io
+  - docker-doc
+  - docker-compose
+  - docker-compose-v2
+  - docker-buildx
+  - podman-docker
+  - containerd
+  - runc
+docker_apt_key_url: "https://download.docker.com/linux/ubuntu/gpg"
+nvidia_container_toolkit_gpg_url: "https://nvidia.github.io/libnvidia-container/gpgkey"
+nvidia_gpu_test_image: "nvidia/cuda:12.2.2-base-ubuntu22.04"
+
+# Ollama configuration.
+# Use a versioned tag instead of the mutable `latest` tag. Re-validate this pin before upgrades.
+ollama_image: "ollama/ollama:0.40.13"
+ollama_model: "qwen2.5:3b"
+ollama_validate_generation: true
+# In GPU mode, fail deployment when Ollama reports the model is not using GPU memory.
+ollama_require_gpu_inference: true
+ollama_api_wait_retries: 30
+ollama_api_wait_delay: 5
+ollama_model_pull_timeout: 7200
+ollama_generation_timeout: 600
+ollama_min_free_disk_gb: 15
+ollama_project_dir: /opt/ollama
+ollama_volume_name: "ollama_data"
+# The published port can be bound externally only with explicit acknowledgement; the playbook
+# does not provision a reverse proxy/firewall/authentication layer for that case.
+ollama_bind_address: "127.0.0.1"
+ollama_public_api_acknowledged: false
+# Ansible runs health checks from the target host; always use loopback even if the published
+# port bind address is changed by an operator.
+ollama_api_check_host: "127.0.0.1"

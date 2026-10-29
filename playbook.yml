@@ -1,0 +1,94 @@
+---
+- name: Configure Ubuntu server and deploy a local LLM API
+  hosts: gpu_servers
+  become: true
+  gather_facts: true
+
+  pre_tasks:
+    - name: Validate operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_version in ubuntu_supported_versions
+        fail_msg: >-
+          This project is configured for Ubuntu {{ ubuntu_supported_versions | join(', ') }}.
+          Detected {{ ansible_distribution }} {{ ansible_distribution_version }}.
+          Add other releases only after validating their driver and package support.
+
+    - name: Validate architecture is supported by the Docker repository mapping
+      ansible.builtin.assert:
+        that:
+          - ansible_architecture in docker_architecture_map
+        fail_msg: >-
+          Unsupported architecture {{ ansible_architecture }}. Supported values:
+          {{ docker_architecture_map.keys() | list | join(', ') }}.
+
+    - name: Validate feature dependencies
+      ansible.builtin.assert:
+        that:
+          - not (install_ollama | bool) or (install_docker | bool) or (docker_preinstalled | bool)
+          - not (install_nvidia_container_toolkit | bool) or (install_docker | bool) or (docker_preinstalled | bool)
+          - not ((install_ollama | bool) and (ollama_enable_gpu | bool)) or (install_nvidia_driver | bool) or (nvidia_driver_preinstalled | bool)
+          - not ((install_ollama | bool) and (ollama_enable_gpu | bool)) or (install_nvidia_container_toolkit | bool) or (nvidia_container_toolkit_preinstalled | bool)
+          - not (install_nvidia_driver | bool) or (ollama_enable_gpu | bool)
+          - not (install_nvidia_container_toolkit | bool) or (ollama_enable_gpu | bool)
+        fail_msg: >-
+          Inconsistent feature flags. Ollama requires Docker; GPU mode requires either installation
+          or explicit declaration of a preinstalled NVIDIA driver and NVIDIA Container Toolkit.
+          Do not install GPU-only components when ollama_enable_gpu=false.
+
+    - name: Validate Ollama bind address
+      ansible.builtin.assert:
+        that:
+          - ollama_bind_address in ['127.0.0.1', '0.0.0.0']
+        fail_msg: >-
+          ollama_bind_address must be 127.0.0.1 (recommended) or 0.0.0.0. Per-interface bindings
+          require a separate health-check configuration and are not supported by this example.
+      when: install_ollama | bool
+
+    - name: Require acknowledgement before publishing Ollama beyond loopback
+      ansible.builtin.assert:
+        that:
+          - ollama_bind_address == '127.0.0.1' or (ollama_public_api_acknowledged | bool)
+        fail_msg: >-
+          Ollama has no built-in API authentication by default. Keep ollama_bind_address at
+          127.0.0.1, or set ollama_public_api_acknowledged=true only after independently
+          configuring an authenticated HTTPS reverse proxy, firewall, and network restrictions.
+      when: install_ollama | bool
+
+    - name: Warn when Ollama is published beyond loopback
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Ollama is being published on {{ ollama_bind_address }}. This project does not
+          deploy HTTPS, API authentication, or firewall rules. Verify these protections externally.
+      when:
+        - install_ollama | bool
+        - ollama_bind_address != '127.0.0.1'
+
+  roles:
+    - role: docker
+      when: install_docker | bool
+
+    - role: nvidia_driver
+      when:
+        - ollama_enable_gpu | bool
+        - install_nvidia_driver | bool
+
+    - role: nvidia_container_toolkit
+      when:
+        - ollama_enable_gpu | bool
+        - install_nvidia_container_toolkit | bool
+        - not (nvidia_reboot_pending | default(false) | bool)
+
+    - role: ollama
+      when:
+        - install_ollama | bool
+        - not (nvidia_reboot_pending | default(false) | bool)
+
+  post_tasks:
+    - name: Explain deferred NVIDIA setup
+      ansible.builtin.debug:
+        msg: >-
+          The NVIDIA driver was installed but reboot was disabled. GPU-dependent roles and Ollama
+          deployment were skipped. Reboot the target, confirm `nvidia-smi`, then rerun this Playbook.
+      when: nvidia_reboot_pending | default(false) | bool

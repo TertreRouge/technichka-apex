@@ -1,0 +1,152 @@
+---
+- name: Ensure Ollama project directory exists
+  ansible.builtin.file:
+    path: "{{ ollama_project_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Determine Docker's data directory
+  ansible.builtin.command:
+    argv:
+      - docker
+      - info
+      - --format
+      - "{{ '{{' }}.DockerRootDir{{ '}}' }}"
+  register: ollama_docker_root_dir
+  changed_when: false
+
+- name: Check free space for Docker images and model weights
+  ansible.builtin.command:
+    argv:
+      - df
+      - -Pk
+      - --output=avail
+      - "{{ ollama_docker_root_dir.stdout | trim }}"
+  register: ollama_docker_disk_free
+  changed_when: false
+
+- name: Require sufficient free disk space before pulling image and model
+  ansible.builtin.assert:
+    that:
+      - (ollama_docker_disk_free.stdout_lines[-1] | trim | int) >= ((ollama_min_free_disk_gb | int) * 1024 * 1024)
+    fail_msg: >-
+      Docker data directory {{ ollama_docker_root_dir.stdout | trim }} has less than
+      {{ ollama_min_free_disk_gb }} GiB free. Expand the disk or lower the configured threshold
+      only after checking the selected image and model sizes.
+
+- name: Render Ollama Docker Compose configuration
+  ansible.builtin.template:
+    src: compose.yml.j2
+    dest: "{{ ollama_project_dir }}/compose.yml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Deploy or update Ollama container
+  community.docker.docker_compose_v2:
+    project_src: "{{ ollama_project_dir }}"
+    state: present
+    pull: missing
+    wait: true
+    wait_timeout: 240
+
+- name: Wait for Ollama HTTP API to become available
+  ansible.builtin.uri:
+    url: "http://{{ ollama_api_check_host }}:11434/api/version"
+    method: GET
+    status_code: 200
+    return_content: true
+  register: ollama_api_version
+  retries: "{{ ollama_api_wait_retries }}"
+  delay: "{{ ollama_api_wait_delay }}"
+  until: ollama_api_version.status | default(0) == 200
+
+- name: List models already present in Ollama
+  ansible.builtin.uri:
+    url: "http://{{ ollama_api_check_host }}:11434/api/tags"
+    method: GET
+    status_code: 200
+    return_content: true
+  register: ollama_existing_models
+  changed_when: false
+
+- name: Download configured Ollama model if it is not present
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - ollama
+      - ollama
+      - pull
+      - "{{ ollama_model }}"
+  async: "{{ ollama_model_pull_timeout }}"
+  poll: 15
+  register: ollama_pull_result
+  changed_when: true
+  when: ollama_model not in (ollama_existing_models.json.models | default([]) | map(attribute='name') | list)
+
+- name: Verify API can generate a response with the configured model
+  ansible.builtin.uri:
+    url: "http://{{ ollama_api_check_host }}:11434/api/generate"
+    method: POST
+    body_format: json
+    body:
+      model: "{{ ollama_model }}"
+      prompt: "Reply with exactly the word OK."
+      stream: false
+      keep_alive: "10m"
+    status_code: 200
+    return_content: true
+    timeout: "{{ ollama_generation_timeout }}"
+  register: ollama_generation_test
+  when: ollama_validate_generation | bool
+
+- name: Assert model generation returned non-empty text
+  ansible.builtin.assert:
+    that:
+      - ollama_generation_test.json is defined
+      - (ollama_generation_test.json.response | default('') | trim | length) > 0
+    fail_msg: >-
+      Ollama API responded, but the generation smoke test returned an empty response.
+      Check container logs with: docker logs ollama
+  when: ollama_validate_generation | bool
+
+- name: Inspect active Ollama model placement
+  ansible.builtin.command:
+    argv:
+      - docker
+      - exec
+      - ollama
+      - ollama
+      - ps
+  register: ollama_active_model_state
+  changed_when: false
+  when:
+    - ollama_enable_gpu | bool
+    - ollama_require_gpu_inference | bool
+    - ollama_validate_generation | bool
+
+- name: Assert model is active and Ollama reports GPU placement
+  ansible.builtin.assert:
+    that:
+      - ollama_model in ollama_active_model_state.stdout
+      - "'GPU' in (ollama_active_model_state.stdout | upper)"
+    fail_msg: >-
+      The API generated a response, but `ollama ps` did not show the configured model using GPU.
+      Inspect `docker exec ollama ollama ps`, `nvidia-smi`, and Ollama logs. This check is skipped
+      in CPU-only mode; GPU usage should be verified on the target host.
+  when:
+    - ollama_enable_gpu | bool
+    - ollama_require_gpu_inference | bool
+    - ollama_validate_generation | bool
+
+- name: Show deployment summary
+  ansible.builtin.debug:
+    msg:
+      - "Ollama API check: http://{{ ollama_api_check_host }}:11434"
+      - "Configured model: {{ ollama_model }}"
+      - "GPU mode enabled: {{ ollama_enable_gpu | bool }}"
+      - "Image: {{ ollama_image }}"
+      - "Remote access: use an SSH tunnel unless an authenticated reverse proxy is configured."
